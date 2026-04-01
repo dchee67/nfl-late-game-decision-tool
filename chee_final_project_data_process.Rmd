@@ -1,0 +1,377 @@
+# =========================================================
+# NFL Late-Game Decision Support Tool
+# Data Processing Script
+# =========================================================
+
+
+# 0. Libraries
+
+library(dplyr)
+library(nflreadr)
+library(tibble)
+
+
+# 1. Helper functions
+
+safe_mean <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+safe_median <- function(x) {
+  if (all(is.na(x))) NA_real_ else median(x, na.rm = TRUE)
+}
+
+map_play_bucket <- function(play_type) {
+  case_when(
+    play_type %in% c("run") ~ "Run",      
+    play_type %in% c("pass") ~ "Pass",
+    play_type %in% c("qb_spike") ~ "Spike",
+    play_type %in% c("qb_kneel") ~ "Kneel",
+    play_type %in% c("field_goal") ~ "Field Goal Attempt",
+    TRUE ~ "Other"
+  )
+}
+
+bucket_time <- function(x) {
+  case_when(
+    x <= 30 ~ "0-30",
+    x <= 60 ~ "31-60",
+    x <= 90 ~ "61-90",
+    x <= 120 ~ "91-120",
+    TRUE ~ NA_character_
+  )
+}
+
+bucket_score <- function(x) {
+  case_when(
+    x <= -8 ~ "Down 8+",
+    x <= -4 ~ "Down 4-7",
+    x <= -1 ~ "Down 1-3",
+    x == 0 ~ "Tied",
+    x <= 3 ~ "Up 1-3",
+    x <= 7 ~ "Up 4-7",
+    x >= 8 ~ "Up 8+",
+    TRUE ~ NA_character_
+  )
+}
+
+bucket_yardline <- function(x) {
+  case_when(
+    x <= 20 ~ "1-20",
+    x <= 40 ~ "21-40",
+    x <= 60 ~ "41-60",
+    x <= 80 ~ "61-80",
+    x <= 99 ~ "81-99",
+    TRUE ~ NA_character_
+  )
+}
+
+
+# 2. Parameters / file paths
+
+seasons_to_use <- 2015:2025
+
+project_path <- "C:/Users/dchee/Documents/Grad School/MSDS 456 - Sports Performance Analytics/Final Project"
+
+base_rds_path <- file.path(project_path, "simulator_base.rds")
+summary_rds_path <- file.path(project_path, "simulator_summary_mvp.rds")
+
+
+# 3. Load raw play-by-play data
+
+pbp <- nflreadr::load_pbp(seasons_to_use) %>%
+  as_tibble()
+
+
+# 4. Keep only columns needed for the project
+
+pbp_small <- pbp %>%
+  select(
+    season,
+    game_id,
+    play_id,
+    drive,
+    qtr,
+    posteam,
+    defteam,
+    home_team,
+    away_team,
+    game_seconds_remaining,
+    half_seconds_remaining,
+    score_differential,
+    yardline_100,
+    down,
+    ydstogo,
+    play_type,
+    posteam_timeouts_remaining,
+    defteam_timeouts_remaining,
+    touchdown,
+    field_goal_result,
+    interception,
+    fumble_lost,
+    epa,
+    desc
+  ) %>%
+  filter(
+    !is.na(game_id),
+    !is.na(play_id),
+    !is.na(drive),
+    !is.na(posteam),
+    !is.na(down),
+    !is.na(ydstogo),
+    !is.na(yardline_100),
+    !is.na(score_differential)
+  )
+
+
+# 5. Create late-game subset
+#    - End of Half = Q2 with <= 120 seconds in half
+#    - End of Game = Q4 with <= 120 seconds in game
+
+pbp_late <- pbp_small %>%
+  mutate(
+    situation_type = case_when(
+      qtr == 2 & half_seconds_remaining <= 120 ~ "End of Half",
+      qtr == 4 & game_seconds_remaining <= 120 ~ "End of Game",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(situation_type))
+
+
+# 6. Compute seconds burned on the immediate next play
+
+pbp_late <- pbp_late %>%
+  arrange(game_id, play_id) %>%
+  group_by(game_id) %>%
+  mutate(
+    next_game_seconds_remaining = lead(game_seconds_remaining),
+    next_half_seconds_remaining = lead(half_seconds_remaining),
+    sec_elapsed_next_play = case_when(
+      situation_type == "End of Half" ~ half_seconds_remaining - next_half_seconds_remaining,
+      situation_type == "End of Game" ~ game_seconds_remaining - next_game_seconds_remaining,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    sec_elapsed_next_play = if_else(
+      !is.na(sec_elapsed_next_play) &
+        sec_elapsed_next_play >= 0 &
+        sec_elapsed_next_play <= 60,
+      sec_elapsed_next_play,
+      NA_real_
+    )
+  )
+
+
+# 7. Collapse detailed play types into app-friendly buckets
+
+pbp_late <- pbp_late %>%
+  mutate(
+    next_play_bucket = map_play_bucket(play_type)
+  )
+
+
+# 8. Build drive-level outcomes
+#    These are eventual outcomes of the drive from that point
+
+drive_outcomes <- pbp_small %>%
+  group_by(game_id, drive) %>%
+  summarize(
+    drive_td = as.integer(any(touchdown == 1, na.rm = TRUE)),
+    drive_fg = as.integer(any(field_goal_result == "made", na.rm = TRUE)),
+    drive_turnover = as.integer(any(interception == 1 | fumble_lost == 1, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    drive_any_score = as.integer(drive_td == 1 | drive_fg == 1),
+    drive_outcome = case_when(
+      drive_td == 1 ~ "TD",
+      drive_fg == 1 ~ "FG",
+      drive_turnover == 1 ~ "Turnover",
+      TRUE ~ "No Score"
+    )
+  )
+
+
+# 9. Join drive outcomes back to late-game play-level data
+
+simulator_base <- pbp_late %>%
+  left_join(drive_outcomes, by = c("game_id", "drive")) %>%
+  filter(!is.na(drive_outcome))
+
+
+# 10. Keep only the play types used in the app
+
+simulator_base <- simulator_base %>%
+  filter(next_play_bucket %in% c("Run", "Pass", "Spike", "Field Goal Attempt", "Kneel"))
+
+
+# 11. Add simulator buckets
+#    These are the inputs used on the Situation Simulator tab
+
+simulator_base <- simulator_base %>%
+  mutate(
+    clock_remaining = case_when(
+      situation_type == "End of Half" ~ half_seconds_remaining,
+      situation_type == "End of Game" ~ game_seconds_remaining,
+      TRUE ~ NA_real_
+    ),
+    time_bucket = bucket_time(clock_remaining),
+    score_bucket = bucket_score(score_differential),
+    yardline_bucket = bucket_yardline(yardline_100)
+  ) %>%
+  filter(
+    !is.na(time_bucket),
+    !is.na(score_bucket),
+    !is.na(yardline_bucket)
+  )
+
+
+# 12. Build summary table for simulator tab
+#    One row per:
+#    situation_type x time_bucket x score_bucket x yardline_bucket x play_bucket
+
+simulator_summary_mvp <- simulator_base %>%
+  group_by(
+    situation_type,
+    time_bucket,
+    score_bucket,
+    yardline_bucket,
+    next_play_bucket
+  ) %>%
+  summarize(
+    n = n(),
+    avg_sec_elapsed = safe_mean(sec_elapsed_next_play),
+    median_sec_elapsed = safe_median(sec_elapsed_next_play),
+    avg_yardline = safe_mean(yardline_100),
+    avg_epa = safe_mean(epa),
+    p_td = safe_mean(drive_td),
+    p_fg = safe_mean(drive_fg),
+    p_any_score = safe_mean(drive_any_score),
+    p_turnover = safe_mean(drive_turnover),
+    .groups = "drop"
+  )
+
+
+# 13. Join bucket-level metrics back onto simulator_base
+#    This supports:
+#    - historical evidence table
+#    - KPI summaries
+#    - selected drive detail view later
+
+simulator_base <- simulator_base %>%
+  left_join(
+    simulator_summary_mvp %>%
+      select(
+        situation_type,
+        time_bucket,
+        score_bucket,
+        yardline_bucket,
+        next_play_bucket,
+        p_any_score,
+        avg_epa
+      ),
+    by = c(
+      "situation_type",
+      "time_bucket",
+      "score_bucket",
+      "yardline_bucket",
+      "next_play_bucket"
+    )
+  )
+
+
+# 14. Final column order
+#    Keep identifiers needed for selected-drive table:
+#    game_id, drive, play_id
+
+simulator_base <- simulator_base %>%
+  select(
+    situation_type,
+    season,
+    game_id,
+    play_id,
+    drive,
+    qtr,
+    posteam,
+    defteam,
+    game_seconds_remaining,
+    half_seconds_remaining,
+    clock_remaining,
+    time_bucket,
+    score_differential,
+    score_bucket,
+    yardline_100,
+    yardline_bucket,
+    down,
+    ydstogo,
+    posteam_timeouts_remaining,
+    defteam_timeouts_remaining,
+    next_play_bucket,
+    sec_elapsed_next_play,
+    epa,
+    avg_epa,
+    drive_outcome,
+    drive_td,
+    drive_fg,
+    drive_any_score,
+    p_any_score,
+    drive_turnover,
+    desc
+  )
+
+
+# 15. Save outputs
+
+saveRDS(simulator_base, "simulator_base.rds")
+saveRDS(simulator_summary_mvp, "simulator_summary_mvp.rds")
+
+cat("Saved simulator_base.rds\n")
+cat("Path:", base_rds_path, "\n")
+cat("Rows:", nrow(simulator_base), "\n")
+cat("Columns:", ncol(simulator_base), "\n\n")
+
+cat("Saved simulator_summary_mvp.rds\n")
+cat("Path:", summary_rds_path, "\n")
+cat("Rows:", nrow(simulator_summary_mvp), "\n")
+cat("Columns:", ncol(simulator_summary_mvp), "\n")
+
+
+# 16. QC checks
+#    Keeping these for validation
+
+cat("\n=== QC: simulator_base ===\n")
+print(range(simulator_base$season, na.rm = TRUE))
+print(table(simulator_base$situation_type, useNA = "ifany"))
+print(table(simulator_base$score_bucket, useNA = "ifany"))
+print(table(simulator_base$time_bucket, useNA = "ifany"))
+print(table(simulator_base$yardline_bucket, useNA = "ifany"))
+print(table(simulator_base$next_play_bucket, useNA = "ifany"))
+
+cat("\n=== QC: simulator_summary_mvp ===\n")
+print(range(simulator_summary_mvp$n, na.rm = TRUE))
+print(dim(simulator_summary_mvp))
+print(table(simulator_summary_mvp$situation_type, useNA = "ifany"))
+print(table(simulator_summary_mvp$score_bucket, useNA = "ifany"))
+print(table(simulator_summary_mvp$time_bucket, useNA = "ifany"))
+print(table(simulator_summary_mvp$yardline_bucket, useNA = "ifany"))
+print(table(simulator_summary_mvp$next_play_bucket, useNA = "ifany"))
+
+cat("\n=== QC: example rows from simulator_summary_mvp ===\n")
+print(
+  simulator_summary_mvp %>%
+    arrange(desc(n)) %>%
+    select(
+      situation_type,
+      time_bucket,
+      score_bucket,
+      yardline_bucket,
+      next_play_bucket,
+      n,
+      p_any_score,
+      avg_epa
+    ) %>%
+    head(20)
+)
